@@ -30,6 +30,6 @@ CMD ["--help"]
 
 EXPOSE 11434
 
-LABEL org.opencontainers.image.title="Vibe-Hacker"
-LABEL org.opencontainers.image.description="Autonomous offensive security agent"
-LABEL org.opencontainers.image.version="3.0"
+LABEL org.opencontainers.image.title="Apex-Automation"
+LABEL org.opencontainers.image.description="AI-assisted penetration testing automation — autonomous pentesting agent powered by Ollama"
+LABEL org.opencontainers.image.version="4.0"
