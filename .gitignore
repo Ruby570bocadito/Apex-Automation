@@ -11,6 +11,8 @@ venv/
 .venv/
 env/
 .env
+metrics.jsonl
+todo.txt
 checkpoints/*.json
 !checkpoints/.gitkeep
 logs/*.log
