@@ -16,6 +16,8 @@ import select
 import importlib
 import sqlite3
 import argparse
+import csv
+import io
 import shutil
 import hashlib
 from pathlib import Path
@@ -758,6 +760,9 @@ class NucleiScanner:
     @staticmethod
     def scan(target: str, severity: str = "critical,high,medium") -> str:
         cmd = f"nuclei -u {target} -severity {severity} -silent -json -retries 2"
+        safe, msg = sanitize_command(cmd)
+        if not safe:
+            return f"Nuclei bloqueado por seguridad: {msg}"
         try:
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=900
@@ -771,6 +776,9 @@ class NucleiScanner:
     @staticmethod
     def scan_with_templates(target: str, templates: str) -> str:
         cmd = f"nuclei -u {target} -t {templates} -silent"
+        safe, msg = sanitize_command(cmd)
+        if not safe:
+            return f"Nuclei bloqueado por seguridad: {msg}"
         try:
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=900
@@ -1001,7 +1009,10 @@ class ReportGenerator:
     def to_html(self) -> str:
         flags = self.session.get("flags", "Ninguna")
         findings = self.session.get("findings", "Sin hallazgos")
-        phase_timings = json.loads(self.session.get("phase_timings", "{}"))
+        try:
+            phase_timings = json.loads(self.session.get("phase_timings") or "{}")
+        except (ValueError, TypeError):
+            phase_timings = {}
 
         cves_html = ""
         for cve in self.cves:
@@ -1014,7 +1025,7 @@ class ReportGenerator:
             commands_html += f"""
             <div class="command">
                 <h4>[{cmd["timestamp"]}] {cmd["vibe"]} ({cmd.get("duration", 0)}s)</h4>
-                <pre class="command-cmd">{cmd["command"]}</pre>
+                <pre class="command-cmd">{self._escape_html(cmd["command"])}</pre>
                 <details>
                     <summary>Ver salida ({len(cmd["output"])} chars)</summary>
                     <pre class="command-out">{self._escape_html(cmd["output"][:2000])}</pre>
@@ -1102,10 +1113,27 @@ class ReportGenerator:
         )
 
     def to_csv(self) -> str:
-        output = "timestamp,vibe,command,duration,exit_code\n"
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["timestamp", "vibe", "command", "duration", "exit_code"])
         for cmd in self.commands:
-            output += f'"{cmd["timestamp"]}","{cmd["vibe"]}","{cmd["command"]}",{cmd.get("duration", 0)},{cmd.get("exit_code", 0)}\n'
-        return output
+            writer.writerow(
+                [
+                    self._safe_csv_cell(cmd["timestamp"]),
+                    self._safe_csv_cell(cmd["vibe"]),
+                    self._safe_csv_cell(cmd["command"]),
+                    cmd.get("duration", 0),
+                    cmd.get("exit_code", 0),
+                ]
+            )
+        return buf.getvalue()
+
+    @staticmethod
+    def _safe_csv_cell(value: str) -> str:
+        value = str(value)
+        if value and value[0] in "=+-@":
+            value = "'" + value
+        return value
 
     def _escape_html(self, text: str) -> str:
         return (
@@ -1116,6 +1144,9 @@ class ReportGenerator:
         )
 
     def save(self, format: str = "both") -> list[Path]:
+        # "all" (usado por el CLI `report` y la shell interactiva) equivale a los 4 formatos
+        if format == "all":
+            format = "both"
         paths = []
         target = self.session["target_ip"].replace(".", "_")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1346,6 +1377,8 @@ def sanitize_command(command: str) -> tuple[bool, str]:
     for blocked in COMMAND_BLACKLIST:
         if blocked.lower() in cmd_lower:
             return False, f"Comando bloqueado: {blocked}"
+    if re.search(r"[;&|`]|\$\(|>>?|<<?", command):
+        return False, "Operadores de shell no permitidos (;, &, |, `, $(, <, >)"
     first_word = cmd_lower.split()[0] if cmd_lower.split() else ""
     if first_word not in COMMAND_ALLOWLIST:
         return False, f"Comando no permitido: {first_word}"
@@ -1473,7 +1506,9 @@ def extract_flags_and_cves(
 
 
 def get_ai_response(messages: list, retries: int = 3) -> str:
-    payload = {"model": MODEL, "messages": messages, "stream": False, "format": "json"}
+    model = config.get("model", MODEL)
+    url = config.get("ollama_url", OLLAMA_URL)
+    payload = {"model": model, "messages": messages, "stream": False, "format": "json"}
     stop_spinner = threading.Event()
     spinner_thread = threading.Thread(target=spinner_task, args=(stop_spinner,))
     spinner_thread.start()
@@ -1481,7 +1516,7 @@ def get_ai_response(messages: list, retries: int = 3) -> str:
 
     for attempt in range(retries):
         try:
-            response = requests.post(OLLAMA_URL, json=payload, timeout=300)
+            response = requests.post(url, json=payload, timeout=300)
             stop_spinner.set()
             spinner_thread.join()
             response.raise_for_status()
@@ -1500,7 +1535,9 @@ def get_ai_response(messages: list, retries: int = 3) -> str:
     return f"ERROR OLLAMA: {last_error}"
 
 
-def run_audit(target_ip: str, resume: bool = False) -> int:
+def run_audit(
+    target_ip: str, resume: bool = False, aggressive: Optional[bool] = None
+) -> int:
     global plugin_manager
 
     db = Database()
@@ -1550,8 +1587,9 @@ INICIA RECON AHORA.""",
     )
     cprint(f"{'=' * 60}\n", Colors.CYAN, bold=True)
     cprint(f"[+] Sesion: {session_id} | Target: {target_ip}", Colors.GREEN)
+    aggressive_mode = aggressive if aggressive is not None else config.get("aggressive_mode")
     cprint(
-        f"[i] Modo: {'AGRESIVO' if config.get('aggressive_mode') else 'NORMAL'}",
+        f"[i] Modo: {'AGRESIVO' if aggressive_mode else 'NORMAL'}",
         Colors.YELLOW,
     )
     cprint("[i] Comandos: !help para ayuda\n", Colors.DIM)
@@ -1565,6 +1603,7 @@ INICIA RECON AHORA.""",
 
     Telemetry.log_audit_start(target_ip, session_id)
 
+    consecutive_failures = 0
     try:
         while shell.running:
             prompts_data = load_prompts()
@@ -1575,8 +1614,34 @@ INICIA RECON AHORA.""",
 
             try:
                 decision = json.loads(raw_response)
+                consecutive_failures = 0
             except Exception:
+                consecutive_failures += 1
                 cprint(f"\n[!] Error JSON: {raw_response[:200]}...", Colors.RED)
+                if raw_response.startswith("ERROR OLLAMA") and consecutive_failures >= 5:
+                    cprint(
+                        "[!] Ollama no disponible tras 5 intentos. Abortando auditoria.",
+                        Colors.RED,
+                    )
+                    db.update_session(
+                        session_id,
+                        status="failed",
+                        finished_at=datetime.now().isoformat(),
+                    )
+                    shell.running = False
+                    break
+                if consecutive_failures >= 10:
+                    cprint(
+                        "[!] Respuestas invalidas repetidas. Abortando auditoria.",
+                        Colors.RED,
+                    )
+                    db.update_session(
+                        session_id,
+                        status="failed",
+                        finished_at=datetime.now().isoformat(),
+                    )
+                    shell.running = False
+                    break
                 history.append({"role": "user", "content": "ERROR: JSON invalido."})
                 continue
 
@@ -2022,7 +2087,7 @@ Ejemplos:
         return
 
     if args.cmd == "run":
-        run_audit(args.target, resume=args.resume)
+        run_audit(args.target, resume=args.resume, aggressive=args.aggressive or None)
     elif args.cmd == "list":
         cmd_list(argparse.Namespace(status=args.status))
     elif args.cmd == "info":
@@ -2032,7 +2097,7 @@ Ejemplos:
             argparse.Namespace(session_id=args.session, ip=None, format=args.format)
         )
     elif args.cmd == "diff":
-        cmd_diff(argparse.Namespace(session1=args.s1, session2=args.s2))
+        cmd_diff(argparse.Namespace(s1=args.s1, s2=args.s2))
     elif args.cmd == "lessons":
         cmd_lessons(args)
     elif args.cmd == "clean":
